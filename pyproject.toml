@@ -1,0 +1,40 @@
+[build-system]
+# Minimum requirements for the build system to execute.
+# see PEP518: https://www.python.org/dev/peps/pep-0518/
+requires = [
+    "numpy",
+    "setuptools >= 61.0.0",
+    "wheel",
+    ]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qm-cartopy-plugin"
+version = "0.1.0"
+description = "Cartopy-backed 2-D event summary plugin for QuakeMigrate"
+readme = "README.md"
+license = {text = "GPLv3"}
+requires-python = ">=3.13"
+dependencies = [
+  "quakemigrate",
+  "cartopy",
+  "pyproj",
+  "matplotlib",
+  "numpy",
+]
+authors = [
+    {name = "Conor A. Bacon", email = "conor.bacon@norsar.no"},
+]
+
+[project.entry-points."quakemigrate.plugins"]
+EventSummary2DCartopy = "cartopy_event_summary.plugin:EventSummary2DCartopyPlugin"
+
+[tool.uv.sources]
+quakemigrate = { git = "https://github.com/QuakeMigrate/QuakeMigrate.git", branch = "staging/v1.3.0" }
+
+[project.urls]
+GitHub = "https://github.com/hemmelig/CartopyEventSummaryPlugin"
+Issues = "https://github.com/hemmelig/CartopyEventSummaryPlugin/issues"
+
+[tool.ruff]
+line-length = 88
