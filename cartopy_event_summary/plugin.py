@@ -29,32 +29,36 @@ class EventSummary2DCartopyPlugin:
     """
     Plugin that generates a 2-D event summary plot for a located event.
 
-    This plugin runs during the locate stage and calls
-    :func:`quakemigrate.plot.event.event_summary_2d` using the located event, lookup
-    table, run metadata, and marginalised coalescence map supplied in the runtime
-    context.
-
     Attributes
     ----------
     stage:
-        Processing stage in which the plugin is executed.
+        Processing stage where the plugin runs.
     order:
-        Relative execution order within the stage. Lower values run earlier.
+        Execution ordering relative to other locate plugins.
     name:
-        Plugin name used in configuration and reporting.
+        Registered plugin identifier.
     kind:
-        Plugin category.
+        Category for plugin discovery.
     overlay_manifest:
-        Optional path to an overlay manifest used to add overlays to the plot.
+        Optional CSV manifest of geographic line/scatter overlays.
     slice_mode:
-        Type of 2-D slice to plot. "maximum" plots the maximum-amplitude slice;
-        "surface" plots a fixed-depth surface slice.
+        Select maximum-coalescence or fixed-depth XY slice.
     surface_depth:
-        Depth of the surface slice when slice_mode is "surface".
+        Depth for the fixed-depth surface slice, in LUT grid units.
     plot_all_stations:
-        Whether to plot all stations, rather than only stations used for the event.
+        Plot every station or only those with available data.
     file_type:
-        Output file type passed to the plotting function.
+        Matplotlib output format.
+    borders:
+        Draw Natural Earth political boundaries.
+    rivers:
+        Draw Natural Earth rivers and lakes.
+    cities:
+        Draw Natural Earth populated places.
+    city_scale:
+        Populated-places resolution.
+    natural_earth_scale:
+        Coastline and hydrology resolution.
 
     """
 
@@ -69,7 +73,6 @@ class EventSummary2DCartopyPlugin:
     plot_all_stations: bool = True
     file_type: str = "pdf"
 
-    # Cartopy-specific options
     borders: bool = True
     rivers: bool = True
     cities: bool = True
@@ -89,13 +92,13 @@ class EventSummary2DCartopyPlugin:
         Parameters
         ----------
         event:
-            Located event to summarise.
+            Located event with stations and waveform data.
         lut:
-            Lookup table used for event location.
+            Grid and coordinate reference information.
         run:
-            QuakeMigrate run metadata and output configuration.
+            Run identifier, output path, and subname.
         marginalised_coa_map:
-            Marginalised coalescence map for the located event.
+            Coalescence volume of shape (nx, ny, nz) in LUT grid-index order.
 
         """
 

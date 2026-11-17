@@ -17,13 +17,16 @@ using Cartopy/Natural Earth datasets.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Literal
 
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import matplotlib.pyplot as plt
+import matplotlib.patheffects as path_effects
 import numpy as np
 from cartopy.io import shapereader
+from cartopy.mpl.geoaxes import GeoAxes
 from matplotlib.gridspec import GridSpec
 from quakemigrate.plot.event import (
     _extract_2d_coalescence_slices,
@@ -37,10 +40,15 @@ from quakemigrate.plot.maps import plot_map_overlays
 from .crs import cartopy_projection_from_proj, data_crs_from_proj
 
 
+if TYPE_CHECKING:
+    from quakemigrate.io import Event, Run, Station
+    from quakemigrate.lut import LUT
+
+
 @dataclass
 class CartopyMapAxes2D:
     """
-    Container for the Cartopy 2-D map axes used by the event summary plot.
+    Axes and coordinate metadata for the geographic map panel.
 
     Attributes
     ----------
@@ -50,25 +58,22 @@ class CartopyMapAxes2D:
         Matplotlib axes used for the coalescence colourbar.
     bounds:
         Lookup-table grid bounds in projected grid coordinates before unit conversion.
-        The expected shape is (3, 2), with rows corresponding to x, y, and z, and
+        The expected shape is (3, 2), with rows corresponding to x, y, and depth, and
         columns corresponding to minimum and maximum values.
     map_crs:
-        Cartopy projection used by the horizontal map panel. Projected LUT grid data
-        should be plotted with this CRS as the Matplotlib transform.
+        CRS of the map grid coordinates (Cartopy projection units).
     data_crs:
-        Cartopy CRS used for coordinate-space data. For normal QuakeMigrate coordinate
-        projections this is usually ccrs.PlateCarree().
+        Geographic CRS of stations and event locations (degrees).
     unit_conversion_factor:
-        Multiplicative factor used to convert LUT projected grid units into the units
-        expected by the Cartopy projection. For LUTs defined in kilometres and Cartopy
-        projections expecting metres, this is normally 1000.0.
+        Conversion from LUT horizontal grid units to Cartopy map units: metres for
+        projected CRSs or degrees for geographic CRSs.
 
     """
 
-    xy: object
-    cax: object
+    xy: GeoAxes
+    cax: plt.Axes
     bounds: np.ndarray
-    map_crs: ccrs.CRS
+    map_crs: ccrs.Projection
     data_crs: ccrs.CRS
     unit_conversion_factor: float = 1.0
 
@@ -91,8 +96,7 @@ class CartopyMapAxes2D:
 def build_2d_cartopy_map_axes(
     fig: plt.Figure,
     gs: tuple[int, int],
-    lut,
-    *,
+    lut: LUT,
     natural_earth_scale: str = "10m",
     borders: bool = True,
     rivers: bool = True,
@@ -140,16 +144,8 @@ def build_2d_cartopy_map_axes(
 
     map_crs = cartopy_projection_from_proj(lut.grid_proj)
     data_crs = data_crs_from_proj(lut.coord_proj)
-    unit_conversion_factor = _get_lut_unit_conversion_factor(lut)
 
-    xy = plt.subplot2grid(
-        gs,
-        (2, 0),
-        colspan=7,
-        rowspan=6,
-        fig=fig,
-        projection=map_crs,
-    )
+    xy = plt.subplot2grid(gs, (2, 0), colspan=7, rowspan=6, fig=fig, projection=map_crs)
     cax = plt.subplot2grid(gs, (8, 5), colspan=2, rowspan=1, fig=fig)
     cax.set_axis_off()
 
@@ -157,9 +153,7 @@ def build_2d_cartopy_map_axes(
     geographic_extent = _geographic_extent_from_lut(lut)
 
     _set_projected_map_limits(
-        xy,
-        bounds,
-        unit_conversion_factor=unit_conversion_factor,
+        xy, bounds, unit_conversion_factor=lut.unit_conversion_factor
     )
 
     xy.coastlines(resolution=natural_earth_scale, zorder=40)
@@ -168,8 +162,12 @@ def build_2d_cartopy_map_axes(
         xy.add_feature(cfeature.BORDERS.with_scale(natural_earth_scale), zorder=39)
 
     if rivers:
-        xy.add_feature(cfeature.RIVERS.with_scale(natural_earth_scale), alpha=0.3, zorder=35)
-        xy.add_feature(cfeature.LAKES.with_scale(natural_earth_scale), alpha=0.3, zorder=35)
+        xy.add_feature(
+            cfeature.RIVERS.with_scale(natural_earth_scale), alpha=0.3, zorder=35
+        )
+        xy.add_feature(
+            cfeature.LAKES.with_scale(natural_earth_scale), alpha=0.3, zorder=35
+        )
 
     if cities:
         _plot_natural_earth_cities(
@@ -200,15 +198,15 @@ def build_2d_cartopy_map_axes(
         bounds=bounds,
         map_crs=map_crs,
         data_crs=data_crs,
-        unit_conversion_factor=unit_conversion_factor,
+        unit_conversion_factor=lut.unit_conversion_factor,
     )
 
 
 def event_summary_2d_cartopy(
-    run,
-    event,
-    marginalised_coa_map,
-    lut,
+    run: Run,
+    event: Event,
+    marginalised_coa_map: np.ndarray,
+    lut: LUT,
     slice_mode: Literal["surface", "maximum"] = "surface",
     surface_depth: float = 0.0,
     overlay_manifest: str | None = None,
@@ -266,103 +264,89 @@ def event_summary_2d_cartopy(
     """
 
     fig = plt.figure(figsize=(25, 15))
-    grid_dimensions = (9, 15)
 
-    gs = GridSpec(*grid_dimensions)
-    text_summary = fig.add_subplot(gs[0:2, 0:8])
-    waveform_gather = fig.add_subplot(gs[0:7, 8:15])
-    coalescence_timeseries = fig.add_subplot(gs[7:9, 8:15])
+    try:
+        grid_dimensions = (9, 15)
 
-    coalescence_map = build_2d_cartopy_map_axes(
-        fig,
-        grid_dimensions,
-        lut,
-        natural_earth_scale=natural_earth_scale,
-        borders=borders,
-        rivers=rivers,
-        cities=cities,
-        city_scale=city_scale,
-    )
+        layout = GridSpec(*grid_dimensions)
+        text_summary = fig.add_subplot(layout[0:2, 0:8])
+        waveform_gather = fig.add_subplot(layout[0:7, 8:15])
+        coalescence_timeseries = fig.add_subplot(layout[7:9, 8:15])
 
-    _plot_text_summary(text_summary, lut, event)
-
-    idx_max, slices = _extract_2d_coalescence_slices(
-        marginalised_coa_map,
-        lut,
-        slice_mode,
-        surface_depth,
-    )
-
-    _plot_coalescence_panels_cartopy(coalescence_map, slices)
-
-    if plot_all_stations:
-        station_list = event.data.stations
-    else:
-        station_names = {
-            key.split("_")[0]
-            for key, available in event.onset_data.availability.items()
-            if available == 1
-        }
-        station_list = [
-            station for station in event.data.stations if station.id in station_names
-        ]
-
-    _plot_stations_cartopy(coalescence_map, station_list, "white")
-    _plot_hypocentre_cartopy(coalescence_map, event.hypocentre)
-
-    if overlay_manifest is not None:
-        plot_map_overlays(overlay_manifest, coalescence_map.xy)
-
-    _plot_waveform_gather(
-        waveform_gather,
-        lut,
-        event,
-        idx_max,
-        station_list,
-    )
-
-    _plot_coalescence_trace(coalescence_timeseries, event)
-
-    for ax in [waveform_gather, coalescence_timeseries]:
-        ax.axvline(
-            event.otime.datetime,
-            label="Origin time",
-            ls="--",
-            lw=2,
-            c="#F03B20",
+        map_axes = build_2d_cartopy_map_axes(
+            fig,
+            grid_dimensions,
+            lut,
+            natural_earth_scale=natural_earth_scale,
+            borders=borders,
+            rivers=rivers,
+            cities=cities,
+            city_scale=city_scale,
         )
 
-    handles, labels = waveform_gather.get_legend_handles_labels()
-    handles, labels = _merge_waveform_legend_labels(
-        handles,
-        labels,
-        event.onset_data.channel_maps,
-    )
+        _plot_text_summary(text_summary, lut, event)
 
-    waveform_gather.legend(
-        handles,
-        labels,
-        fontsize=14,
-        loc=1,
-        framealpha=1,
-        markerscale=0.5,
-    )
-    coalescence_timeseries.legend(fontsize=14, loc=1, framealpha=1)
+        idx_max, slices = _extract_2d_coalescence_slices(
+            marginalised_coa_map, lut, slice_mode, surface_depth
+        )
+        _plot_coalescence_panels_cartopy(map_axes, slices)
 
-    fig.tight_layout(pad=1, h_pad=0)
-    plt.subplots_adjust(wspace=0.3, hspace=0.3)
+        if plot_all_stations:
+            station_list = event.data.stations
+        else:
+            station_names = {
+                key.split("_")[0]
+                for key, available in event.onset_data.availability.items()
+                if available == 1
+            }
+            station_list = [
+                station
+                for station in event.data.stations
+                if station.id in station_names
+            ]
 
-    fpath = run.path / "locate" / run.subname / "summaries"
-    fpath.mkdir(exist_ok=True, parents=True)
+        _plot_stations_cartopy(map_axes, station_list, "white")
+        _plot_hypocentre_cartopy(map_axes, event.hypocentre)
+        _plot_uncertainty_cartopy(map_axes, lut, event)
 
-    fstem = f"{run.name}_{event.uid}_EventSummary2DCartopy"
-    file = (fpath / fstem).with_suffix(f".{file_type}")
+        if overlay_manifest is not None:
+            plot_map_overlays(overlay_manifest, map_axes.xy)
 
-    fig.savefig(file, dpi=400)
-    plt.close(fig)
+        _plot_waveform_gather(waveform_gather, lut, event, idx_max, station_list)
+
+        _plot_coalescence_trace(coalescence_timeseries, event)
+
+        for ax in [waveform_gather, coalescence_timeseries]:
+            ax.axvline(
+                event.otime.datetime, label="Origin time", ls="--", lw=2, c="#f03b20"
+            )
+
+        handles, labels = waveform_gather.get_legend_handles_labels()
+        handles, labels = _merge_waveform_legend_labels(
+            handles, labels, event.onset_data.channel_maps
+        )
+
+        waveform_gather.legend(
+            handles, labels, fontsize=14, loc=1, framealpha=1, markerscale=0.5
+        )
+        coalescence_timeseries.legend(fontsize=14, loc=1, framealpha=1)
+
+        fig.tight_layout(pad=1, h_pad=0)
+        plt.subplots_adjust(wspace=0.3, hspace=0.3)
+
+        fpath = run.path / "locate" / run.subname / "summaries"
+        fpath.mkdir(exist_ok=True, parents=True)
+
+        fstem = f"{run.name}_{event.uid}_EventSummary2DCartopy"
+
+        fig.savefig((fpath / fstem).with_suffix(f".{file_type}"), dpi=400)
+    finally:
+        plt.close(fig)
 
 
-def _plot_coalescence_panels_cartopy(axes: CartopyMapAxes2D, slices) -> None:
+def _plot_coalescence_panels_cartopy(
+    axes: CartopyMapAxes2D, slices: dict[str, np.ndarray]
+) -> None:
     """
     Plot the 2-D coalescence slice on the Cartopy map panel.
 
@@ -387,10 +371,7 @@ def _plot_coalescence_panels_cartopy(axes: CartopyMapAxes2D, slices) -> None:
         slice_ = slices[ax_label]
         nx, ny = [dim + 1 for dim in slice_.shape]
 
-        grid1, grid2 = np.mgrid[
-            gminx : gmaxx : nx * 1j,
-            gminy : gmaxy : ny * 1j,
-        ]
+        grid1, grid2 = np.mgrid[gminx : gmaxx : nx * 1j, gminy : gmaxy : ny * 1j]
 
         sc = ax.pcolormesh(
             grid1 * axes.unit_conversion_factor,
@@ -402,23 +383,15 @@ def _plot_coalescence_panels_cartopy(axes: CartopyMapAxes2D, slices) -> None:
         )
 
         cb = axes.cax.figure.colorbar(
-            sc,
-            ax=axes.cax,
-            orientation="horizontal",
-            fraction=0.8,
-            aspect=8,
+            sc, ax=axes.cax, orientation="horizontal", fraction=0.8, aspect=8
         )
         cb.ax.set_xlabel(
-            "Normalised coalescence\nvalue",
-            rotation=0,
-            fontsize=14,
+            "Normalised coalescence\nvalue", rotation=0, fontsize=14
         )
 
 
 def _plot_stations_cartopy(
-    axes: CartopyMapAxes2D,
-    stations,
-    c: str = "white",
+    axes: CartopyMapAxes2D, stations: Iterable[Station], c: str = "white"
 ) -> None:
     """
     Plot station locations on the Cartopy map panel.
@@ -451,9 +424,7 @@ def _plot_stations_cartopy(
 
 
 def _plot_hypocentre_cartopy(
-    axes: CartopyMapAxes2D,
-    hypocentre: list[float],
-    c: str = "white",
+    axes: CartopyMapAxes2D, hypocentre: list[float], c: str = "white"
 ) -> None:
     """
     Plot hypocentre crosshairs on the Cartopy map panel.
@@ -483,11 +454,44 @@ def _plot_hypocentre_cartopy(
     )
 
 
+def _plot_uncertainty_cartopy(axes: CartopyMapAxes2D, lut: LUT, event: Event) -> None:
+    """
+    Add the original QuakeMigrate Gaussian XY ellipse with a CRS transform.
+
+    Parameters
+    ----------
+    axes:
+        Cartopy map axes.
+    lut:
+        LUT used by QuakeMigrate for the Gaussian coordinate covariance.
+    event:
+        Located event containing optional Gaussian covariance metadata.
+
+    """
+
+    result = _gaussian_uncertainty_outline(lut, event)
+
+    if result is None:
+        return
+
+    outline, label = result
+    axes.xy.plot(
+        outline[:, 0] * axes.unit_conversion_factor,
+        outline[:, 1] * axes.unit_conversion_factor,
+        color="#ffffff",
+        linewidth=2.5,
+        zorder=90,
+        label=label,
+        transform=axes.map_crs,
+        path_effects=[
+            path_effects.Stroke(linewidth=5, foreground="black"),
+            path_effects.Normal(),
+        ],
+    )
+
+
 def _plot_natural_earth_cities(
-    ax: plt.Axes,
-    extent: list[float],
-    data_crs: ccrs.CRS,
-    scale: str = "10m",
+    ax: plt.Axes, extent: list[float], data_crs: ccrs.CRS, scale: str = "10m"
 ) -> None:
     """
     Plot Natural Earth populated places within the given geographic extent.
@@ -508,48 +512,42 @@ def _plot_natural_earth_cities(
     lon_min, lon_max, lat_min, lat_max = extent
 
     shp = shapereader.natural_earth(
-        resolution=scale,
-        category="cultural",
-        name="populated_places",
+        resolution=scale, category="cultural", name="populated_places"
     )
 
-    for rec in shapereader.Reader(shp).records():
-        geom = rec.geometry
-        lon, lat = geom.x, geom.y
+    reader = shapereader.Reader(shp)
+    try:
+        for rec in reader.records():
+            geom = rec.geometry
+            if geom is None:
+                continue
 
-        if not (lon_min <= lon <= lon_max and lat_min <= lat <= lat_max):
-            continue
+            lon, lat = geom.x, geom.y
+            if not (lon_min <= lon <= lon_max and lat_min <= lat <= lat_max):
+                continue
 
-        name = rec.attributes.get("NAME") or rec.attributes.get("NAME_EN")
+            name = rec.attributes.get("NAME") or rec.attributes.get("NAME_EN")
 
-        ax.scatter(
-            lon,
-            lat,
-            marker=".",
-            transform=data_crs,
-            zorder=45,
-            c="white",
-        )
-        ax.text(
-            lon,
-            lat,
-            name,
-            fontsize=18,
-            transform=data_crs,
-            zorder=45,
-            clip_on=True,
-            c="white",
-        )
+            ax.scatter(
+                lon, lat, marker=".", transform=data_crs, zorder=45, c="white"
+            )
+            ax.text(
+                lon,
+                lat,
+                name,
+                fontsize=18,
+                transform=data_crs,
+                zorder=45,
+                clip_on=True,
+                c="white",
+            )
+    finally:
+        reader.close()
 
 
-def _projected_grid_bounds_from_lut(lut) -> np.ndarray:
+def _projected_grid_bounds_from_lut(lut: LUT) -> np.ndarray:
     """
-    Return lookup-table bounds in projected grid coordinates.
-
-    lut.get_grid_extent(cells=True) is treated as a coordinate-space extent. The lower
-    and upper corners are transformed into the LUT grid projection with
-    lut.coord2grid(...). The resulting bounds are suitable for building the coalescence
-    slice grid that will be plotted with transform=axes.map_crs.
+    Compute cell-edge bounds directly in native grid coordinates.
 
     Parameters
     ----------
@@ -561,6 +559,11 @@ def _projected_grid_bounds_from_lut(lut) -> np.ndarray:
     numpy.ndarray
         Projected grid bounds with shape (3, 2). Rows correspond to x, y, and z;
         columns correspond to minimum and maximum values.
+
+    Raises
+    ------
+    ValueError
+        If spacing or bounds are not finite and positive.
 
     """
 
@@ -584,13 +587,9 @@ def _projected_grid_bounds_from_lut(lut) -> np.ndarray:
     return np.sort(bounds, axis=1)
 
 
-def _geographic_extent_from_lut(lut) -> list[float]:
+def _geographic_extent_from_lut(lut: LUT) -> list[float]:
     """
     Return the geographic longitude/latitude extent of the lookup table.
-
-    The extent is derived from lut.get_grid_extent(cells=True) and is used only for
-    filtering Natural Earth cities. It assumes the first two coordinate dimensions are
-    longitude and latitude, which is the standard QuakeMigrate coordinate-space setup.
 
     Parameters
     ----------
@@ -604,24 +603,18 @@ def _geographic_extent_from_lut(lut) -> list[float]:
 
     """
 
-    coord_extent = np.asarray(lut.get_grid_extent(cells=True), dtype=float)
+    coord_extent = lut.get_grid_extent(cells=True)
 
     lon_values = coord_extent[:, 0]
     lat_values = coord_extent[:, 1]
 
     return [
-        float(np.min(lon_values)),
-        float(np.max(lon_values)),
-        float(np.min(lat_values)),
-        float(np.max(lat_values)),
+        np.min(lon_values), np.max(lon_values), np.min(lat_values), np.max(lat_values)
     ]
 
 
 def _set_projected_map_limits(
-    ax,
-    bounds: np.ndarray,
-    *,
-    unit_conversion_factor: float,
+    ax, bounds: np.ndarray, unit_conversion_factor: float
 ) -> None:
     """
     Set GeoAxes x/y limits using projected LUT grid bounds.
@@ -645,31 +638,7 @@ def _set_projected_map_limits(
     ax.set_ylim(gminy * unit_conversion_factor, gmaxy * unit_conversion_factor)
 
 
-def _get_lut_unit_conversion_factor(lut) -> float:
-    """
-    Return the LUT-to-Cartopy projected-coordinate unit conversion factor.
-
-    QuakeMigrate LUTs may store projected grid coordinates in kilometres, while
-    Cartopy projection classes usually expect metres. If the LUT exposes
-    unit_conversion_factor, that value is used. Otherwise, the function falls back
-    to 1.0.
-
-    Parameters
-    ----------
-    lut:
-        QuakeMigrate lookup-table object.
-
-    Returns
-    -------
-    float
-        Unit conversion factor to apply to projected grid coordinates before plotting.
-
-    """
-
-    return float(getattr(lut, "unit_conversion_factor", 1.0))
-
-
-def _first_point(points) -> np.ndarray:
+def _first_point(points: np.ndarray) -> np.ndarray:
     """
     Normalise a coordinate-transform result to a single 3-element point.
 
@@ -685,9 +654,106 @@ def _first_point(points) -> np.ndarray:
 
     """
 
-    points = np.asarray(points, dtype=float)
-
     if points.ndim == 1:
         return points
 
     return points[0]
+
+
+def _gaussian_uncertainty_outline(
+    lut: LUT,
+    event: Event,
+    n_sigma: float = 1.0,
+    n_vertices: int = 181,
+) -> tuple[np.ndarray, str] | None:
+    """
+    Calculate a Gaussian XY uncertainty outline in native LUT grid coordinates.
+
+    Parameters
+    ----------
+    lut:
+        LUT providing ``coord2grid`` and horizontal node spacing. Grid units must be
+        consistent with the projection used by the coalescence raster.
+    event:
+        Located event with a spline hypocentre in ``coord_proj`` coordinates and
+        Gaussian uncertainty metadata under ``locations['gaussian']``.
+    n_sigma:
+        Number of standard deviations along the covariance principal axes.
+    n_vertices:
+        Number of points on the closed uncertainty outline, including the repeated
+        first/last point. Must be at least four.
+
+    Returns
+    -------
+    outline, label:
+        Closed (n_vertices, 2) outline in native LUT grid x/y coordinates and a legend
+        label describing the uncertainty measure, or ``None`` when no valid horizontal
+        uncertainty is available.
+
+    Raises
+    ------
+    ValueError
+        If sampling parameters are invalid.
+
+    """
+
+    if not np.isfinite(n_sigma) or n_sigma <= 0:
+        raise ValueError("n_sigma must be finite and positive")
+    if n_vertices < 4:
+        raise ValueError("n_vertices must be at least four")
+
+    gaussian = event.locations.get("gaussian", {})
+    if not gaussian:
+        return None
+
+    covariance = None
+    label = f"Gaussian {n_sigma:g}-sigma uncertainty"
+    physical = gaussian.get("covariance_matrix_physical")
+    index = gaussian.get("covariance_matrix")
+
+    if physical is not None or index is not None:
+        matrix = np.asarray(physical if physical is not None else index, dtype=float)
+        if matrix.shape == (3, 3):
+            covariance = matrix[:2, :2].copy()
+        elif (
+            matrix.shape == (2, 2) and list(gaussian.get("fit_dims", [0, 1])) == [0, 1]
+        ):
+            covariance = matrix.copy()
+        else:
+            return None
+        if physical is None:
+            spacing = np.asarray(lut.node_spacing, dtype=float)[:2]
+            covariance = covariance * np.outer(spacing, spacing)
+    else:
+        try:
+            errors = np.asarray([gaussian["ErrX"], gaussian["ErrY"]], dtype=float)
+        except KeyError:
+            return None
+        if not np.all(np.isfinite(errors)) or np.any(errors <= 0):
+            return None
+        covariance = np.diag(errors**2)
+        label = f"Gaussian {n_sigma:g}-sigma uncertainty (axis-aligned)"
+
+    if not np.all(np.isfinite(covariance)):
+        return None
+
+    covariance = (covariance + covariance.T) / 2.0
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+
+    if np.any(eigenvalues <= 0):
+        return None
+
+    centre_coord = np.asarray(event.get_hypocentre(method="spline"), dtype=float)
+    if centre_coord.shape != (3,) or not np.all(np.isfinite(centre_coord)):
+        return None
+
+    centre_grid = np.asarray(lut.coord2grid(centre_coord), dtype=float)
+    if centre_grid.shape != (1, 3) or not np.all(np.isfinite(centre_grid)):
+        return None
+
+    angles = np.linspace(0, 2 * np.pi, n_vertices)
+    circle = np.vstack((np.cos(angles), np.sin(angles)))
+    offsets = n_sigma * eigenvectors @ np.diag(np.sqrt(eigenvalues)) @ circle
+    outline = centre_grid[0, :2] + offsets.T
+
+    return outline, label

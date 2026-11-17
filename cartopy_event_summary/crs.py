@@ -1,14 +1,10 @@
 """
 Utilities for handling Coordinate Reference Systems.
 
-This module provides helpers for converting QuakeMigrate / pyproj coordinate
-reference system definitions into Cartopy coordinate reference system objects. The
-resulting Cartopy objects are used both as GeoAxes projections and as Matplotlib
-transform=... arguments when plotting data on Cartopy-backed figures.
-
-The conversion intentionally supports only a small set of common projections. Unknown
-projected coordinate systems fail explicitly rather than silently plotting data in an
-incorrect CRS.
+This module provides helpers for converting QuakeMigrate / pyproj coordinate reference
+system definitions into Cartopy coordinate reference system objects. The resulting
+Cartopy objects are used both as GeoAxes projections and as Matplotlib transform=...
+arguments when plotting data on Cartopy-backed figures.
 
 :copyright:
     2026, Conor A. Bacon
@@ -20,130 +16,175 @@ incorrect CRS.
 
 from __future__ import annotations
 
+import math
 import warnings
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, TypeAlias
 
 import cartopy.crs as ccrs
-from pyproj import CRS
+from pyproj import CRS, Proj
 
 
-def cartopy_projection_from_proj(proj: Any) -> ccrs.Projection:
+CRSInput: TypeAlias = CRS | Proj | str | Mapping[str, object]
+
+
+def cartopy_projection_from_proj(proj: CRSInput) -> ccrs.Projection:
     """
-    Convert a pyproj-compatible CRS definition into a Cartopy projection.
-
-    The returned object is suitable for use as the projection=... argument when
-    constructing a Cartopy GeoAxes. The input may be a pyproj.Proj object, a
-    pyproj.CRS object, an authority string such as "EPSG:4326", a PROJ string, a PROJ
-    dictionary, or another CRS-like object accepted by pyproj.CRS.from_user_input.
-
-    The function handles the common projected CRS types expected in QuakeMigrate lookup
-    tables. Geographic longitude/latitude coordinate systems are represented with
-    cartopy.crs.PlateCarree. Projected coordinate systems are mapped onto explicit
-    Cartopy projection classes where possible.
+    Create a Cartopy GeoAxes projection that retains the source CRS parameters.
 
     Parameters
     ----------
     proj:
-        Coordinate reference system definition. If the object has a crs attribute, that
-        attribute is passed to pyproj.CRS.from_user_input otherwise proj itself is
-        passed.
+    pyproj-compatible CRS, ``Proj``, dictionary, or authority string.
 
     Returns
     -------
     cartopy.crs.Projection
-        Cartopy projection corresponding to the input CRS.
+        Projection expecting degrees for geographic input or metres for projected input
+        (even if the source CRS axes are measured in kilometres).
 
     Raises
     ------
     NotImplementedError
-        Raised if the input CRS is projected but its projection type is not currently
-        supported by this helper.
-    pyproj.exceptions.CRSError
-        Raised by pyproj.CRS.from_user_input if the input cannot be interpreted as a
-        valid CRS.
+        Unsupported projection family or unrepresentable projection parameters.
 
     """
 
-    crs = CRS.from_user_input(proj.crs if hasattr(proj, "crs") else proj)
+    crs = CRS.from_user_input(proj.crs if isinstance(proj, Proj) else proj)
 
-    if crs.is_geographic:
-        return ccrs.PlateCarree(globe=_globe_from_crs(crs))
 
     params = _proj_params(crs)
-    proj_name = params.get("proj")
-    globe = _globe_from_crs(crs)
 
-    if proj_name == "lcc":
-        lat_1 = _float(params, "lat_1")
-        lat_2 = _float(params, "lat_2", lat_1)
-
-        return ccrs.LambertConformal(
-            central_longitude=_float(params, "lon_0", 0.0),
-            central_latitude=_float(params, "lat_0", 0.0),
-            false_easting=_linear_to_metres(_float(params, "x_0", 0.0), params),
-            false_northing=_linear_to_metres(_float(params, "y_0", 0.0), params),
-            standard_parallels=(lat_1, lat_2),
-            globe=globe,
+    incompatible = {"pm", "towgs84", "nadgrids", "lon_wrap", "over", "axis"}
+    unsupported = incompatible.intersection(params)
+    if unsupported:
+        raise NotImplementedError(
+            f"Cannot represent {crs.name} in Cartopy: "
+            f"datum/axis options that cannot be preserved: {sorted(unsupported)}",
         )
 
-    if proj_name == "utm":
+    globe = _globe_from_crs(crs)
+    if crs.is_geographic:
+        return ccrs.PlateCarree(globe=globe)
+
+    if not crs.is_projected:
+        raise NotImplementedError(
+            f"Cannot represent {crs.name} in Cartopy: ",
+            "only geographic and projected CRSs are supported"
+        )
+
+    name = params.get("proj")
+    scale = cartopy_unit_conversion_factor(crs)
+
+    if name == "utm":
+        if any(key in params for key in ("x_0", "y_0", "k", "k_0")):
+            raise NotImplementedError(
+                f"Cannot represent {crs.name} in Cartopy: "
+                "custom UTM false offsets or scale factors"
+            )
         return ccrs.UTM(
             zone=int(params["zone"]),
-            southern_hemisphere=bool(params.get("south", False)),
+            southern_hemisphere="south" in params,
             globe=globe,
         )
 
-    if proj_name == "tmerc":
+    if name == "lcc":
+        first_parallel = _float(params, "lat_1", _float(params, "lat_0"))
+        second_parallel = _float(params, "lat_2", first_parallel)
+        if "k" in params or "k_0" in params:
+            raise NotImplementedError(
+                f"Cannot represent {crs.name} in Cartopy: "
+                "Lambert scale factor cannot be preserved"
+            )
+        return ccrs.LambertConformal(
+            central_longitude=_float(params, "lon_0"),
+            central_latitude=_float(params, "lat_0"),
+            false_easting=_float(params, "x_0") * scale,
+            false_northing=_float(params, "y_0") * scale,
+            standard_parallels=(first_parallel, second_parallel),
+            globe=globe,
+        )
+
+    if name == "tmerc":
         return ccrs.TransverseMercator(
-            central_longitude=_float(params, "lon_0", 0.0),
-            central_latitude=_float(params, "lat_0", 0.0),
-            false_easting=_linear_to_metres(_float(params, "x_0", 0.0), params),
-            false_northing=_linear_to_metres(_float(params, "y_0", 0.0), params),
+            central_longitude=_float(params, "lon_0"),
+            central_latitude=_float(params, "lat_0"),
+            false_easting=_float(params, "x_0") * scale,
+            false_northing=_float(params, "y_0") * scale,
             scale_factor=_float(params, "k", _float(params, "k_0", 1.0)),
             globe=globe,
         )
 
-    if proj_name == "merc":
+    if name == "merc":
+        if _float(params, "lat_0") != 0:
+            raise NotImplementedError(
+                f"Cannot represent {crs.name} in Cartopy: "
+                "Mercator latitude of origin other than zero"
+            )
+        if "lat_ts" in params and ("k" in params or "k_0" in params):
+            raise NotImplementedError(
+                f"Cannot represent {crs.name} in Cartopy: "
+                "Mercator with both lat_ts and scale factor"
+            )
         return ccrs.Mercator(
-            central_longitude=_float(params, "lon_0", 0.0),
-            min_latitude=-80.0,
-            max_latitude=84.0,
+            central_longitude=_float(params, "lon_0"),
+            false_easting=_float(params, "x_0") * scale,
+            false_northing=_float(params, "y_0") * scale,
+            latitude_true_scale=(
+                None if "lat_ts" not in params else _float(params, "lat_ts")
+            ),
+            scale_factor=(
+                None
+                if "lat_ts" in params
+                else _float(params, "k", _float(params, "k_0", 1.0))
+            ),
             globe=globe,
         )
 
-    if proj_name == "stere":
+    if name == "stere":
+        if "k" in params or "k_0" in params:
+            raise NotImplementedError(
+                f"Cannot represent {crs.name} in Cartopy: "
+                "stereographic scale factor cannot be preserved"
+            )
         return ccrs.Stereographic(
-            central_longitude=_float(params, "lon_0", 0.0),
-            central_latitude=_float(params, "lat_0", 0.0),
-            false_easting=_linear_to_metres(_float(params, "x_0", 0.0), params),
-            false_northing=_linear_to_metres(_float(params, "y_0", 0.0), params),
-            true_scale_latitude=_float(params, "lat_ts", None),
+            central_longitude=_float(params, "lon_0"),
+            central_latitude=_float(params, "lat_0"),
+            false_easting=_float(params, "x_0") * scale,
+            false_northing=_float(params, "y_0") * scale,
+            true_scale_latitude=(
+                None if "lat_ts" not in params else _float(params, "lat_ts")
+            ),
             globe=globe,
         )
 
-    if proj_name == "aeqd":
+    if name == "aeqd":
+        if "k" in params or "k_0" in params or "lat_ts" in params:
+            raise NotImplementedError(
+                f"Cannot represent {crs.name} in Cartopy: "
+                "non-standard azimuthal equidistant parameters"
+            )
         return ccrs.AzimuthalEquidistant(
-            central_longitude=_float(params, "lon_0", 0.0),
-            central_latitude=_float(params, "lat_0", 0.0),
-            false_easting=_linear_to_metres(_float(params, "x_0", 0.0), params),
-            false_northing=_linear_to_metres(_float(params, "y_0", 0.0), params),
+            central_longitude=_float(params, "lon_0"),
+            central_latitude=_float(params, "lat_0"),
+            false_easting=_float(params, "x_0") * scale,
+            false_northing=_float(params, "y_0") * scale,
             globe=globe,
         )
 
-    if proj_name == "eqc":
-        return ccrs.PlateCarree(
-            central_longitude=_float(params, "lon_0", 0.0),
-            globe=globe,
+    if name == "eqc":
+        raise NotImplementedError(
+            f"Cannot represent {crs.name} in Cartopy: "
+            "projected eqc cannot use degree-based PlateCarree"
         )
 
     raise NotImplementedError(
-        "Cannot automatically convert this CRS to a Cartopy GeoAxes projection yet. "
-        f"CRS name: {crs.name}; authority: {crs.to_authority()}; "
-        f"operation method: {_operation_method_name(crs)}"
+        f"Cannot represent {crs.name} in Cartopy: "
+        f"projection family {name}"
     )
 
 
-def data_crs_from_proj(proj: Any) -> ccrs.CRS:
+def data_crs_from_proj(proj: CRSInput) -> ccrs.CRS:
     """
     Convert a pyproj-compatible CRS definition into a Cartopy data CRS.
 
@@ -188,10 +229,10 @@ def _globe_from_crs(crs: CRS) -> ccrs.Globe:
     """
     Build a Cartopy globe from the ellipsoid associated with a pyproj CRS.
 
-    Cartopy projections can be supplied with a Globe object to preserve the
-    semi-major and semi-minor axes of the source CRS ellipsoid. This helper extracts
-    those axes from the pyproj CRS and disables Cartopy's named ellipsoid shortcut by
-    passing ellipse=None.
+    Cartopy projections can be supplied with a Globe object to preserve the semi-major
+    and semi-minor axes of the source CRS ellipsoid. This helper extracts those axes
+    from the pyproj CRS and disables Cartopy's named ellipsoid shortcut by passing
+    ellipse=None.
 
     Parameters
     ----------
@@ -211,37 +252,23 @@ def _globe_from_crs(crs: CRS) -> ccrs.Globe:
     semiminor_axis = ellipsoid.semi_minor_metre
 
     return ccrs.Globe(
-        semimajor_axis=semimajor_axis,
-        semiminor_axis=semiminor_axis,
-        ellipse=None,
+        semimajor_axis=semimajor_axis, semiminor_axis=semiminor_axis, ellipse=None
     )
 
 
 def _proj_params(crs: CRS) -> dict[str, Any]:
     """
-    Return PROJ-style parameters from a pyproj CRS.
-
-    This helper centralises the intentional conversion from a rich pyproj CRS object to
-    a PROJ-style dictionary. The conversion may be lossy in general, so pyproj emits a
-    warning. In this module the dictionary is only used to select a supported Cartopy
-    projection constructor and extract the small number of projection parameters needed
-    by that constructor.
+    Read PROJ parameters from a CRS while silencing only the known loss warning.
 
     Parameters
     ----------
     crs:
-        pyproj coordinate reference system to convert into a PROJ-style parameter
-        dictionary.
+        Source reference system.
 
     Returns
     -------
-    dict of str to Any
-        PROJ-style CRS parameters, for example {"proj": "lcc", "lat_1": ...}.
-
-    Notes
-    -----
-    This function suppresses pyproj's lossy-conversion warning locally. It does not
-    suppress other warnings elsewhere in the application.
+    proj_params:
+        Parameters used only to select and configure a supported projection.
 
     """
 
@@ -251,115 +278,127 @@ def _proj_params(crs: CRS) -> dict[str, Any]:
             message="You will likely lose important projection information.*",
             category=UserWarning,
         )
+
         return crs.to_dict()
 
 
-def _operation_method_name(crs: CRS) -> str | None:
+def _float(params: Mapping[str, Any], key: str, default: float = 0.0) -> float:
     """
-    Return the coordinate operation method name for a CRS, if available.
-
-    This is used only for diagnostics when an unsupported projection is encountered.
-    Some CRS objects, especially geographic CRSs or incomplete definitions, may not
-    expose a coordinate operation.
-
-    Parameters
-    ----------
-    crs:
-        pyproj coordinate reference system to inspect.
-
-    Returns
-    -------
-    str or None
-        Coordinate operation method name if available, otherwise None.
-
-    """
-
-    operation = crs.coordinate_operation
-
-    if operation is None:
-        return None
-
-    return operation.method_name
-
-
-def _float(
-    params: dict[str, Any],
-    key: str,
-    default: Any = None,
-) -> float | None:
-    """
-    Return a parameter value as a float.
+    Return a required numeric PROJ parameter with an explicit default.
 
     Parameters
     ----------
     params:
-        Dictionary of projection parameters.
+        PROJ parameter dictionary.
     key:
-        Parameter key to read from params.
+        Parameter name.
     default:
-        Value to use when key is not present. If the resolved value is None, None is
-        returned.
+        Value when the parameter is absent.
 
     Returns
     -------
-    float or None
-        Parameter value converted to float, or None when the resolved value is None.
+    value:
+        Numeric projection parameter.
 
     Raises
     ------
-    TypeError
-        Raised if the resolved value cannot be converted to float because it has an
-        incompatible type.
     ValueError
-        Raised if the resolved value is a string or object value that cannot be parsed
-        as a floating-point number.
+        Raised if the resolved value cannot be parsed as a floating-point number.
 
     """
 
     value = params.get(key, default)
 
     if value is None:
-        return None
+        raise ValueError(f"PROJ parameter {key} cannot be null")
 
     return float(value)
 
 
-def _linear_to_metres(value: float | None, params: dict[str, Any]) -> float:
+def cartopy_unit_conversion_factor(proj: CRSInput) -> float:
     """
-    Convert a linear projection parameter to metres.
+    Return the conversion from LUT grid units to Cartopy map-axis units.
 
-    Cartopy projection constructors expect false eastings and false northings in metres.
-    Some QuakeMigrate LUT projection definitions use PROJ parameters with units="km", in
-    which case the value must be multiplied by 1000 before being passed to Cartopy.
+    A projected grid is converted to metres. Geographic longitude/latitude grids already
+    using degrees are left in degrees; angular radians-per-degree factors must never be
+    applied to ``PlateCarree`` x/y coordinates.
 
     Parameters
     ----------
-    value:
-        Linear projection value to convert. This is usually a false easting or false
-        northing value read from a PROJ-style parameter dictionary.
-    params:
-        Dictionary of projection parameters. The "units" key is inspected to decide
-        whether conversion from kilometres to metres is required.
+    proj:
+        LUT grid projection.
 
     Returns
     -------
     float
-        Linear projection value in metres.
+        Map units per LUT grid unit (metres or degrees, respectively).
 
     Raises
     ------
-    TypeError
-        Raised if value is None. Projection constructors that require linear offsets
-        should pass a numeric default before calling this helper.
+    NotImplementedError
+        If the geographic axes do not use degrees.
 
     """
 
-    if value is None:
-        raise TypeError("Linear projection value cannot be None.")
+    crs = CRS.from_user_input(proj.crs if isinstance(proj, Proj) else proj)
 
-    units = params.get("units")
+    if crs.is_geographic:
+        if not all(
+            math.isclose(axis.unit_conversion_factor, math.pi / 180.0, rel_tol=1e-10)
+            for axis in crs.axis_info[:2]
+        ):
+            raise NotImplementedError(
+                f"Cannot represent {crs.name} in Cartopy: "
+                "geographic grid coordinates must be degrees"
+            )
+        return 1.0
 
-    if units == "km":
-        return value * 1000.0
+    if not crs.is_projected:
+        raise NotImplementedError(
+            f"Cannot represent {crs.name} in Cartopy: "
+            "only geographic and projected CRSs are supported"
+        )
 
-    return value
+    return _metres_per_unit(crs)
+
+
+def _metres_per_unit(crs: CRS) -> float:
+    """
+    Return the physical metres corresponding to one horizontal grid unit.
+
+    Parameters
+    ----------
+    crs:
+        Projected CRS with linear horizontal axes.
+
+    Returns
+    -------
+    float
+        Positive metres per input unit, including custom PROJ units.
+
+    Raises
+    ------
+    NotImplementedError
+        If axes lack consistent linear units.
+
+    """
+
+    axes = crs.axis_info
+
+    if len(axes) < 2:
+        raise NotImplementedError(
+            f"Cannot represent {crs.name} in Cartopy: missing horizontal axis units"
+        )
+    units = [axis.unit_conversion_factor for axis in axes[:2]]
+
+    if not all(math.isfinite(value) and value > 0 for value in units):
+        raise NotImplementedError(
+            f"Cannot represent {crs.name} in Cartopy: invalid horizontal axis units"
+        )
+
+    if not math.isclose(units[0], units[1], rel_tol=1e-12):
+        raise NotImplementedError(
+            f"Cannot represent {crs.name} in Cartopy: different horizontal axis units"
+        )
+
+    return units[0]
